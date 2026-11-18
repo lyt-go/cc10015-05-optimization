@@ -36,3 +36,14 @@ def health() -> dict[str, object]:
 def overview() -> dict[str, object]:
     """运营概览：把各业务模块的待处理量汇总成看板卡片。"""
     return store.overview()
+
+
+@app.post("/api/test/reset-environment")
+def reset_environment() -> dict[str, object]:
+    """恢复内存仓库到种子初始状态。
+
+    仅用于 E2E 与演示环境：让每次自动化运行都从确定数据开始。生产环境若接入
+    持久化数据库，应删除或用权限保护该接口。
+    """
+    store.reset_all()
+    return {"ok": True, "message": "演练环境已重置为种子状态", "modules": len(store.module_names())}

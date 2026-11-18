@@ -1,4 +1,4 @@
-"""异常检测接口：维护检测规则，覆盖提交校验、标记生效、停用规则等动作。"""
+"""异常检测接口：维护检测规则，并提供信号表的窗口复用构建、显示、确认与跨模块核对。"""
 from __future__ import annotations
 
 import csv
@@ -7,8 +7,9 @@ import io
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, PageResult
 from app.services.anomaly_detect import AnomalyDetectService
+from app.services.anomaly_signals import CHECK_STANDARD, VALID_MODES, signal_service
 
 router = APIRouter(prefix="/api/anomaly_detect", tags=["异常检测"])
 
@@ -51,7 +52,7 @@ def export_entries(
     items, _ = service.list_entries(
         filters=query_filters(request), keyword=keyword, status=status, page=1, size=1000000)
     output = io.StringIO()
-    output.write("\ufeff")
+    output.write("﻿")
     writer = csv.writer(output, lineterminator="\n")
     writer.writerow(["id", *LIST_FIELDS, "status"])
     for item in items:
@@ -63,6 +64,111 @@ def export_entries(
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="anomaly_detect.csv"'})
+
+
+# ----------------------------------------------------------------------
+# 异常检测信号表（V005）：历史数据、基线缓存、构建/续写/显示/确认/消费/核对
+# ----------------------------------------------------------------------
+@router.get("/history/series")
+def get_history(metric: str | None = Query(default=None, description="按监控指标过滤")) -> dict:
+    """读取历史监控数据；按指标过滤，避免每条规则整段重扫。"""
+    rows = signal_service.list_history(metric)
+    return {"ok": True, "total": len(rows), "items": rows}
+
+
+@router.get("/baseline/cache")
+def get_baseline_cache() -> dict:
+    """基线窗口缓存注册表：展示窗口范围、统计量与规则版本同步登记情况。"""
+    rows = signal_service.list_cache_registry()
+    return {"ok": True, "total": len(rows), "items": rows}
+
+
+@router.post("/{entry_id}/signals/build")
+def build_signals(entry_id: int, payload: dict | None = None) -> dict:
+    """构建异常检测信号表：复用可重叠窗口，按 V005 核对阈值、范围和上限。
+
+    payload: {"mode": "auto|reuse_patch|full_rebuild", "fail_after": 可选，用于模拟中断}
+    """
+    payload = payload or {}
+    mode = str(payload.get("mode", "auto"))
+    if mode not in VALID_MODES:
+        raise HTTPException(status_code=400, detail=f"mode 仅支持 {VALID_MODES}")
+    fail_after = payload.get("fail_after")
+    result = signal_service.build_signal_table(
+        entry_id, mode=mode, fail_after=int(fail_after) if fail_after is not None else None)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "信号表构建失败"))
+    return result
+
+
+@router.post("/{entry_id}/signals/resume")
+def resume_signals(entry_id: int) -> dict:
+    """窗口重建中断后按缺失项续写，不覆盖上一完整信号表。"""
+    result = signal_service.resume_build(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message", "续写失败"))
+    return result
+
+
+@router.get("/{entry_id}/signals/display")
+def display_signals(entry_id: int) -> dict:
+    """信号表显示窗：残留事务一旦发现便回滚，并按 V005 留档核对。"""
+    result = signal_service.display_signal_table(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
+
+
+@router.post("/{entry_id}/signals/confirm")
+def confirm_signals(entry_id: int) -> dict:
+    """V005 核对通过后确认信号表，交消费端取得全量信号表。"""
+    result = signal_service.confirm_signal_table(entry_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/signals/overview")
+def signals_overview() -> dict:
+    """全量 V005 异常检测信号表概览，列表侧栏与详情页共用同一组数据。"""
+    return signal_service.list_signal_tables()
+
+
+@router.get("/signals/consumer")
+def consumer_pull() -> dict:
+    """消费端取得全量已确认的 V005 异常检测信号表。"""
+    return signal_service.consumer_pull()
+
+
+@router.get("/signals/cross-check")
+def cross_check(
+    metric: str = Query(description="指标定义模块传入的指标编号"),
+    metric_version: str | None = Query(default=None, description="指标定义口径版本"),
+) -> dict:
+    """跨模块联动（V005）：核对信号表中的指标编号、规则版本与复用窗口基线范围。"""
+    return signal_service.cross_check_metric(metric, metric_version)
+
+
+@router.get("/signals/audit")
+def signal_audit(rule_id: int | None = Query(default=None)) -> dict:
+    """V005 留档核对记录：构建、回滚、续写、确认、跨模块联动全程可追溯。"""
+    rows = signal_service.list_audit(rule_id)
+    return {"ok": True, "核对标准": CHECK_STANDARD, "total": len(rows), "items": rows}
+
+
+@router.post("/signals/reset")
+def reset_signal_environment() -> dict:
+    """演练环境重置：恢复种子规则并清空缓存与信号表（E2E/演示用维护接口）。"""
+    return signal_service.reset_demo_environment()
+
+
+@router.patch("/{entry_id}/rule-config")
+def update_rule_config(entry_id: int, payload: dict) -> dict:
+    """调整基线窗口/波动阈值/上限策略/规则版本，缓存注册表同步登记新版本。"""
+    result = signal_service.change_rule(entry_id, payload)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message"))
+    return result
 
 
 @router.get("/{entry_id}", response_model=dict)

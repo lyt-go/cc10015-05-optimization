@@ -24,6 +24,19 @@ class Store:
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
 
+    def replace_rows(self, module: str, rows: list[dict[str, Any]]) -> None:
+        """整表替换：用于信号表演练环境重置等维护场景。"""
+        self._tables[module] = [dict(row) for row in rows]
+        self._versions[module] = 1
+
+    def reset_all(self) -> None:
+        """恢复到种子初始状态：供 E2E/演示环境在每次运行前获得确定数据。"""
+        self._tables = {
+            name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
+        }
+        self._versions = {name: 1 for name in self._tables}
+        self._created_at = {name: time.time() for name in self._tables}
+
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):
             if int(row.get("id", 0)) == entry_id:
